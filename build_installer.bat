@@ -43,7 +43,7 @@ IF EXIST "dist"  rmdir /s /q "dist"
 :: O PyInstaller falha com OSError(22) ao montar o executavel quando a area
 :: de trabalho fica em unidade de rede -- e este projeto costuma ficar em Z:.
 :: Por isso o build acontece em disco local e o resultado e copiado de volta.
-SET "BUILD_TMP=%TEMP%\gerlau_build"
+SET "BUILD_TMP=%TEMP%\gerex_build"
 IF EXIST "%BUILD_TMP%" rmdir /s /q "%BUILD_TMP%"
 
 echo [INFO] Compilando com PyInstaller (GerEx.spec)...
