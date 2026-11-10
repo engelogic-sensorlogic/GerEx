@@ -7,8 +7,9 @@
    de recorrer ao cache -- justamente onde o aplicativo precisa abrir na hora.
    Agora a pagina vem do cache imediatamente e, se houver rede, uma copia nova
    e baixada em silencio para a proxima abertura. */
-const CACHE = "gerex-campo-v2";
-const ARQUIVOS = ["./", "./index.html"];
+const CACHE = "gerex-campo-v3";
+const ARQUIVOS = ["./", "./index.html", "./manifest.webmanifest", "./icone-192.png",
+                  "./icone-512.png", "./icone-maskable-512.png", "./apple-touch-icon.png"];
 
 self.addEventListener("install", ev => {
   ev.waitUntil(
