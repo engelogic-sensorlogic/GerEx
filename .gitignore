@@ -1,0 +1,48 @@
+# GerEx - .gitignore
+
+# Banco de dados local (dados dos clientes não vão para o repo)
+data/
+*.db
+*.db-journal
+
+# Pastas de clientes (dados dos laudos)
+Clientes/
+
+# Build
+dist/
+build/
+Output/
+
+# Specs gerados pelo PyInstaller sao descartaveis, mas GerEx.spec e a
+# configuracao de build do projeto: sem ele, build_installer.bat nao roda em
+# outra maquina.
+*.spec
+!GerEx.spec
+
+# O .iss e gerado por generate_iss.py a cada build
+*.iss
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log

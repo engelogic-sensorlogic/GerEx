@@ -1,0 +1,644 @@
+"""
+GerEx - Aba de exportacao e importacao de dados (backup e transferencia)
+"""
+import os
+from datetime import datetime
+
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
+    QRadioButton, QButtonGroup, QFileDialog, QMessageBox, QGroupBox,
+    QTextEdit, QProgressBar, QFormLayout, QCompleter
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+import database as db
+import backup
+from styles import COLORS
+
+
+def _mb(n: int) -> str:
+    return "%.1f MB" % (n / 1e6)
+
+
+def _ajustar_botoes(caixa: QMessageBox):
+    """Garante que o rotulo caiba dentro do botao.
+
+    O QDialogButtonBox uniformiza a largura dos botoes pelo sizeHint deles, que
+    nao leva em conta o "padding: 8px 18px" do stylesheet global. Com rotulos
+    longos ("Substituir o existente") o texto acabava cortado nas duas pontas.
+    Aqui a largura minima e calculada a partir do texto renderizado.
+    """
+    for botao in caixa.buttons():
+        largura = botao.fontMetrics().horizontalAdvance(botao.text())
+        # 18px de padding em cada lado, mais folga para variacoes de fonte e
+        # de escalonamento de tela (125%/150%), onde a sobra some rapido.
+        botao.setMinimumWidth(largura + 56)
+
+
+def _combo_pesquisavel() -> QComboBox:
+    """QComboBox que tambem aceita digitar parte do texto para filtrar a lista.
+
+    O texto digitado nunca vira um item novo: ao sair do campo sem escolher
+    uma sugestao, o combo volta a mostrar o item que esta de fato selecionado.
+    """
+    combo = QComboBox()
+    combo.setEditable(True)
+    combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+    completer = combo.completer()
+    completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+    completer.setFilterMode(Qt.MatchFlag.MatchContains)
+    completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+
+    def _restaurar():
+        if combo.currentIndex() >= 0 and combo.currentText() != combo.itemText(combo.currentIndex()):
+            combo.setEditText(combo.itemText(combo.currentIndex()))
+    combo.lineEdit().editingFinished.connect(_restaurar)
+    return combo
+
+
+def _repovoar(combo: QComboBox, itens):
+    """Substitui os itens (rotulo, id) mantendo selecionado o mesmo id, se ainda
+    existir. Os sinais ficam bloqueados; quem chama dispara a cascata."""
+    atual = combo.currentData()
+    combo.blockSignals(True)
+    combo.clear()
+    for rotulo, ident in itens:
+        combo.addItem(rotulo, ident)
+    indice = combo.findData(atual) if atual is not None else -1
+    combo.setCurrentIndex(indice if indice >= 0 else (0 if combo.count() else -1))
+    combo.blockSignals(False)
+
+
+def _rotulo_laudo(l: dict) -> str:
+    return l.get("numero") or l.get("titulo") or "Laudo"
+
+
+class _Tarefa(QThread):
+    """Roda exportacao/importacao fora da thread da interface.
+
+    Pacotes com fotos chegam facilmente a dezenas de MB; feito na thread da
+    interface, a janela congelaria durante a operacao.
+    """
+    concluido = pyqtSignal(object)
+    falhou = pyqtSignal(str)
+
+    def __init__(self, funcao, *args):
+        super().__init__()
+        self._funcao, self._args = funcao, args
+
+    def run(self):
+        try:
+            self.concluido.emit(self._funcao(*self._args))
+        except Exception as e:            # noqa: BLE001 - reportado na interface
+            self.falhou.emit(str(e))
+
+
+class BackupWidget(QWidget):
+    """Exporta e importa pacotes .gex (cliente completo ou área avulsa)."""
+
+    dados_alterados = pyqtSignal()   # avisa a janela para recarregar as telas
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._arquivo_import = None
+        self._manifest = None
+        self._tarefa = None
+        self._build_ui()
+        self.recarregar()
+
+    # ── Construcao ────────────────────────────────────────────────────────
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        topo = QHBoxLayout()
+        topo.addWidget(self._grupo_exportar(), 1)
+        topo.addWidget(self._grupo_importar(), 1)
+        layout.addLayout(topo, 3)
+
+        self.progresso = QProgressBar()
+        self.progresso.setRange(0, 0)          # indeterminado
+        self.progresso.setVisible(False)
+        self.progresso.setFixedHeight(6)
+        self.progresso.setTextVisible(False)
+        layout.addWidget(self.progresso)
+
+        layout.addWidget(QLabel("Registro de operações:"))
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet(
+            "background: #1a2332; color: #d0d7de; font-family: Consolas, monospace;"
+            "font-size: 11px; border-radius: 6px;"
+        )
+        layout.addWidget(self.log, 2)
+
+    def _grupo_exportar(self) -> QGroupBox:
+        cx = QGroupBox("Exportar")
+        v = QVBoxLayout(cx)
+        v.setSpacing(8)
+
+        ajuda = QLabel(
+            "Gera um arquivo .gex com os dados e as fotos. Pode ser gravado "
+            "em qualquer pasta do computador ou da rede."
+        )
+        ajuda.setWordWrap(True)
+        ajuda.setStyleSheet("color: #586069; font-size: 11px;")
+        v.addWidget(ajuda)
+
+        self.rb_cliente = QRadioButton("Cliente completo (laudos, áreas, avaliações e fotos)")
+        self.rb_painel = QRadioButton("Área individual")
+        self.rb_cliente.setChecked(True)
+        self._grupo_escopo = QButtonGroup(self)
+        self._grupo_escopo.addButton(self.rb_cliente, 0)
+        self._grupo_escopo.addButton(self.rb_painel, 1)
+        self._grupo_escopo.idToggled.connect(lambda _i, _c: self._atualizar_escopo())
+        v.addWidget(self.rb_cliente)
+        v.addWidget(self.rb_painel)
+
+        form = QFormLayout()
+        form.setSpacing(6)
+        self.cb_cliente = _combo_pesquisavel()
+        self.cb_cliente.currentIndexChanged.connect(self._carregar_laudos)
+        self.cb_laudo = _combo_pesquisavel()
+        self.cb_laudo.currentIndexChanged.connect(self._carregar_paineis)
+        self.cb_painel = _combo_pesquisavel()
+        form.addRow("Cliente:", self.cb_cliente)
+        self.lbl_laudo = QLabel("Laudo:")
+        self.lbl_painel = QLabel("Área:")
+        form.addRow(self.lbl_laudo, self.cb_laudo)
+        form.addRow(self.lbl_painel, self.cb_painel)
+        v.addLayout(form)
+
+        v.addStretch()
+        self.btn_exportar = QPushButton("Escolher destino e exportar...")
+        self.btn_exportar.setObjectName("btn_accent")
+        self.btn_exportar.clicked.connect(self._exportar)
+        v.addWidget(self.btn_exportar)
+
+        self.btn_checklist = QPushButton("Exportar checklist para o aplicativo de campo")
+        self.btn_checklist.setObjectName("btn_secondary")
+        self.btn_checklist.setToolTip(
+            "Gera um arquivo .json com as perguntas, opções e pesos do checklist, "
+            "para carregar no aplicativo do celular. Exporte novamente sempre que "
+            "editar o checklist na aba ao lado."
+        )
+        self.btn_checklist.clicked.connect(self._exportar_checklist)
+        v.addWidget(self.btn_checklist)
+        return cx
+
+    def _grupo_importar(self) -> QGroupBox:
+        cx = QGroupBox("Importar")
+        v = QVBoxLayout(cx)
+        v.setSpacing(8)
+
+        ajuda = QLabel(
+            "Lê um arquivo .gex. A importação apenas acrescenta dados — "
+            "nada existente é apagado ou sobrescrito."
+        )
+        ajuda.setWordWrap(True)
+        ajuda.setStyleSheet("color: #586069; font-size: 11px;")
+        v.addWidget(ajuda)
+
+        self.btn_escolher = QPushButton("Selecionar arquivo...")
+        self.btn_escolher.setObjectName("btn_secondary")
+        self.btn_escolher.clicked.connect(self._escolher_arquivo)
+        v.addWidget(self.btn_escolher)
+
+        self.lbl_pacote = QLabel("Nenhum arquivo selecionado.")
+        self.lbl_pacote.setWordWrap(True)
+        self.lbl_pacote.setStyleSheet(
+            "color: #586069; font-size: 11px; border: 1px dashed #c8d0d8;"
+            "border-radius: 4px; padding: 8px;"
+        )
+        v.addWidget(self.lbl_pacote)
+
+        # Destino: so faz sentido depois de ler o manifest
+        self.cx_destino = QGroupBox("Destino")
+        dv = QVBoxLayout(self.cx_destino)
+        dv.setSpacing(6)
+        self.rb_novo = QRadioButton("Criar um novo cliente")
+        self.rb_existente = QRadioButton("Acrescentar a um cliente já cadastrado")
+        self.rb_novo.setChecked(True)
+        self.rb_novo.toggled.connect(self._atualizar_destino)
+        dv.addWidget(self.rb_novo)
+        dv.addWidget(self.rb_existente)
+
+        dform = QFormLayout()
+        dform.setSpacing(6)
+        self.cb_cliente_dest = _combo_pesquisavel()
+        self.cb_cliente_dest.currentIndexChanged.connect(self._carregar_laudos_destino)
+        self.cb_laudo_dest = _combo_pesquisavel()
+        dform.addRow("Cliente:", self.cb_cliente_dest)
+        self.lbl_laudo_dest = QLabel("Laudo:")
+        dform.addRow(self.lbl_laudo_dest, self.cb_laudo_dest)
+        dv.addLayout(dform)
+        self.cx_destino.setVisible(False)
+        v.addWidget(self.cx_destino)
+
+        v.addStretch()
+        self.btn_importar = QPushButton("Importar")
+        self.btn_importar.setObjectName("btn_success")
+        self.btn_importar.setEnabled(False)
+        self.btn_importar.clicked.connect(self._importar)
+        v.addWidget(self.btn_importar)
+        return cx
+
+    # ── Carga dos combos ──────────────────────────────────────────────────
+    def showEvent(self, evento):
+        # Recarrega sempre que a aba fica visivel -- tanto ao trocar de sub-aba
+        # quanto ao voltar para Configuracoes pelo menu lateral. Clientes,
+        # laudos (numero, titulo) e paineis podem ter mudado em outra tela.
+        super().showEvent(evento)
+        self.recarregar()
+
+    def recarregar(self):
+        """Recarrega clientes, laudos e paineis, preservando a selecao atual."""
+        clientes = [(c["razao_social"], c["id"]) for c in db.listar_clientes()]
+        for combo in (self.cb_cliente, self.cb_cliente_dest):
+            _repovoar(combo, clientes)
+        self._carregar_laudos()
+        self._carregar_laudos_destino()
+        self._atualizar_escopo()
+
+    def _carregar_laudos(self):
+        cid = self.cb_cliente.currentData()
+        laudos = db.listar_laudos(cid) if cid else []
+        _repovoar(self.cb_laudo, [(_rotulo_laudo(l), l["id"]) for l in laudos])
+        self._carregar_paineis()
+
+    def _carregar_paineis(self):
+        lid = self.cb_laudo.currentData()
+        paineis = db.listar_paineis(lid) if lid else []
+        _repovoar(self.cb_painel, [
+            ("%s  (%s)" % (p.get("tag") or "sem TAG", p.get("setor") or "—"), p["id"])
+            for p in paineis])
+
+    def _carregar_laudos_destino(self):
+        cid = self.cb_cliente_dest.currentData()
+        laudos = db.listar_laudos(cid) if cid else []
+        _repovoar(self.cb_laudo_dest, [(_rotulo_laudo(l), l["id"]) for l in laudos])
+
+    def _atualizar_escopo(self):
+        por_painel = self.rb_painel.isChecked()
+        for w in (self.lbl_laudo, self.cb_laudo, self.lbl_painel, self.cb_painel):
+            w.setVisible(por_painel)
+
+    def _atualizar_destino(self):
+        if not self._manifest:
+            return
+        tipo = self._manifest.get("tipo")
+        if tipo in ("painel", "paineis"):
+            # Um painel precisa obrigatoriamente de um laudo existente
+            self.cb_cliente_dest.setVisible(True)
+            self.lbl_laudo_dest.setVisible(True)
+            self.cb_laudo_dest.setVisible(True)
+        else:
+            usa_existente = self.rb_existente.isChecked()
+            self.cb_cliente_dest.setVisible(usa_existente)
+            self.lbl_laudo_dest.setVisible(False)
+            self.cb_laudo_dest.setVisible(False)
+
+    # ── Log e estado ──────────────────────────────────────────────────────
+    def _log(self, texto: str):
+        self.log.append("[%s]  %s" % (datetime.now().strftime("%H:%M:%S"), texto))
+
+    def _ocupado(self, ocupado: bool):
+        self.progresso.setVisible(ocupado)
+        self.btn_exportar.setEnabled(not ocupado)
+        self.btn_checklist.setEnabled(not ocupado)
+        self.btn_escolher.setEnabled(not ocupado)
+        self.btn_importar.setEnabled(not ocupado and self._arquivo_import is not None)
+
+    # ── Exportacao ────────────────────────────────────────────────────────
+    def _exportar(self):
+        por_painel = self.rb_painel.isChecked()
+        carimbo = datetime.now().strftime("%Y-%m-%d")
+
+        if por_painel:
+            painel_id = self.cb_painel.currentData()
+            if not painel_id:
+                QMessageBox.warning(self, "Exportar", "Selecione uma área.")
+                return
+            tag = self.cb_painel.currentText().split("  (")[0]
+            sugerido = "Area_%s_%s%s" % (tag, carimbo, backup.EXTENSAO)
+        else:
+            cliente_id = self.cb_cliente.currentData()
+            if not cliente_id:
+                QMessageBox.warning(self, "Exportar", "Selecione um cliente.")
+                return
+            sugerido = "Cliente_%s_%s%s" % (self.cb_cliente.currentText()[:40], carimbo,
+                                            backup.EXTENSAO)
+
+        sugerido = "".join(ch if ch.isalnum() or ch in " _-." else "_" for ch in sugerido)
+        caminho, _ = QFileDialog.getSaveFileName(
+            self, "Salvar pacote de dados", sugerido,
+            "Pacote GerEx (*%s)" % backup.EXTENSAO)
+        if not caminho:
+            return
+        if not caminho.lower().endswith(backup.EXTENSAO):
+            caminho += backup.EXTENSAO
+
+        self._ocupado(True)
+        if por_painel:
+            self._log("Exportando área para %s ..." % caminho)
+            self._tarefa = _Tarefa(backup.exportar_painel, self.cb_painel.currentData(), caminho)
+        else:
+            self._log("Exportando cliente para %s ..." % caminho)
+            self._tarefa = _Tarefa(backup.exportar_cliente, self.cb_cliente.currentData(), caminho)
+        self._tarefa.concluido.connect(self._exportacao_ok)
+        self._tarefa.falhou.connect(self._operacao_falhou)
+        self._tarefa.start()
+
+    def _exportacao_ok(self, r: dict):
+        self._ocupado(False)
+        if "painel" in r:
+            self._log("Área '%s' exportada. %s avaliações, %s foto(s), %s."
+                      % (r["painel"], r["avaliacoes"], r["fotos"], _mb(r["tamanho"])))
+        else:
+            self._log("Cliente '%s' exportado. %s laudo(s), %s área(s), %s foto(s), %s."
+                      % (r["cliente"], r["laudos"], r["paineis"], r["fotos"], _mb(r["tamanho"])))
+        ausentes = r.get("fotos_ausentes") or []
+        if ausentes:
+            self._log("AVISO: %d foto(s) do banco não foram encontradas no disco e ficaram "
+                      "de fora do pacote." % len(ausentes))
+            for caminho in ausentes[:5]:
+                self._log("   ausente: %s" % caminho)
+            if len(ausentes) > 5:
+                self._log("   ... e mais %d." % (len(ausentes) - 5))
+        QMessageBox.information(self, "Exportação concluída",
+                                "Pacote gravado em:\n%s\n\nTamanho: %s"
+                                % (r["arquivo"], _mb(r["tamanho"])))
+
+    def _exportar_checklist(self):
+        sugerido = "checklist_gerex_%s%s" % (datetime.now().strftime("%Y-%m-%d"),
+                                            backup.EXTENSAO_CHECKLIST)
+        caminho, _ = QFileDialog.getSaveFileName(
+            self, "Salvar checklist para o aplicativo de campo", sugerido,
+            "Checklist GerEx (*%s)" % backup.EXTENSAO_CHECKLIST)
+        if not caminho:
+            return
+        if not caminho.lower().endswith(backup.EXTENSAO_CHECKLIST):
+            caminho += backup.EXTENSAO_CHECKLIST
+        try:
+            r = backup.exportar_checklist(caminho)
+        except Exception as e:            # noqa: BLE001 - reportado na interface
+            self._log("ERRO ao exportar checklist: %s" % e)
+            QMessageBox.critical(self, "Falha na exportação", str(e))
+            return
+        self._log("Checklist exportado: %d itens, %d opções, %.1f KB -> %s"
+                  % (r["itens"], r["opcoes"], r["tamanho"] / 1024, r["arquivo"]))
+        QMessageBox.information(
+            self, "Checklist exportado",
+            "Arquivo gravado em:\n%s\n\n%d itens e %d opções de resposta.\n\n"
+            "Carregue este arquivo no aplicativo do celular. Sempre que editar "
+            "o checklist, exporte de novo para manter os dois iguais."
+            % (r["arquivo"], r["itens"], r["opcoes"]))
+
+    # ── Importacao ────────────────────────────────────────────────────────
+    def _escolher_arquivo(self):
+        # .zip tambem entra no filtro: ao compartilhar do celular, o Android so
+        # aceita extensoes que reconhece e o pacote chega renomeado para .zip.
+        # O conteudo e o mesmo -- o tipo e identificado pelo manifest interno.
+        caminho, _ = QFileDialog.getOpenFileName(
+            self, "Selecionar pacote de dados", "",
+            "Pacote GerEx (*%s *.zip);;Todos os arquivos (*)" % backup.EXTENSAO)
+        if not caminho:
+            return
+        try:
+            manifest = backup.ler_manifest(caminho)
+        except backup.BackupErro as e:
+            self._arquivo_import = self._manifest = None
+            self.cx_destino.setVisible(False)
+            self.btn_importar.setEnabled(False)
+            self.lbl_pacote.setText("Arquivo inválido.")
+            QMessageBox.critical(self, "Arquivo inválido", str(e))
+            return
+
+        self._arquivo_import, self._manifest = caminho, manifest
+        resumo = manifest.get("resumo", {})
+        tipo = manifest.get("tipo")
+        if tipo == "cliente":
+            descricao = ("Cliente: <b>%s</b><br>%s laudo(s), %s área(s)"
+                         % (resumo.get("cliente", "—"), resumo.get("laudos", 0),
+                            resumo.get("paineis", 0)))
+            self.rb_novo.setVisible(True)
+            self.rb_existente.setVisible(True)
+        elif tipo == "paineis":
+            tags = resumo.get("tags") or []
+            lista = ", ".join(tags[:8]) + (" ..." if len(tags) > 8 else "")
+            descricao = ("Áreas: <b>%s</b><br>%s<br>%s avaliações"
+                         % (resumo.get("paineis", len(tags)), lista or "—",
+                            resumo.get("avaliacoes", 0)))
+            self.rb_novo.setVisible(False)
+            self.rb_existente.setVisible(False)
+        else:
+            descricao = ("Área: <b>%s</b><br>Origem: %s<br>%s avaliações"
+                         % (resumo.get("painel", "—"), resumo.get("cliente", "—"),
+                            resumo.get("avaliacoes", 0)))
+            self.rb_novo.setVisible(False)
+            self.rb_existente.setVisible(False)
+
+        self.lbl_pacote.setText(
+            "%s<br><span style='color:#8a9bb0'>%s &nbsp;|&nbsp; gerado em %s</span>"
+            % (descricao, os.path.basename(caminho), manifest.get("gerado_em", "—")))
+        self.cx_destino.setVisible(True)
+        self._atualizar_destino()
+        self.btn_importar.setEnabled(True)
+        self._log("Pacote selecionado: %s (tipo: %s)" % (os.path.basename(caminho), tipo))
+
+    def _perguntar(self, titulo: str, texto: str, rotulo_novo: str,
+                   rotulo_substituir: str):
+        """Caixa com tres saidas. Devolve 'novo', 'substituir' ou None."""
+        cx = QMessageBox(self)
+        cx.setWindowTitle(titulo)
+        cx.setIcon(QMessageBox.Icon.Question)
+        cx.setText(texto)
+        bt_novo = cx.addButton(rotulo_novo, QMessageBox.ButtonRole.AcceptRole)
+        bt_sub = cx.addButton(rotulo_substituir, QMessageBox.ButtonRole.DestructiveRole)
+        cx.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        cx.setDefaultButton(bt_novo)
+        _ajustar_botoes(cx)
+        cx.exec()
+        if cx.clickedButton() is bt_novo:
+            return "novo"
+        if cx.clickedButton() is bt_sub:
+            return "substituir"
+        return None
+
+    def _resolver_conflito_painel(self, laudo_id: int, alvo: str):
+        """Decide o modo de importacao de um painel. None = cancelar."""
+        try:
+            conf = backup.conflito_painel(self._arquivo_import, laudo_id)
+        except backup.BackupErro as e:
+            QMessageBox.critical(self, "Falha ao ler o pacote", str(e))
+            return None
+
+        tag = self._manifest.get("resumo", {}).get("painel", "—")
+        if not conf:
+            if QMessageBox.question(
+                    self, "Confirmar importação",
+                    "Importar a área '%s' para:\n\n%s" % (tag, alvo)
+            ) != QMessageBox.StandardButton.Yes:
+                return None
+            return "novo"
+
+        partes = []
+        if conf.get("tag_existente"):
+            partes.append("Já existe uma área com a identificação '%s' neste laudo (Nº Form %s)."
+                          % (conf.get("tag"), conf.get("formulario_existente")))
+        else:
+            partes.append("O Nº Form %s do pacote já está ocupado neste laudo."
+                          % conf.get("formulario_origem"))
+        partes.append("")
+        partes.append("Destino: %s" % alvo)
+        return self._perguntar(
+            "Área já existente", "\n".join(partes),
+            "Criar novo (Nº Form %s)" % conf.get("formulario_sugerido"),
+            "Substituir o existente")
+
+    def _resolver_conflito_paineis(self, laudo_id: int, alvo: str):
+        """Decide o modo de importacao de um pacote com varios paineis.
+        None = cancelar."""
+        try:
+            repetidos = backup.conflito_paineis(self._arquivo_import, laudo_id)
+        except backup.BackupErro as e:
+            QMessageBox.critical(self, "Falha ao ler o pacote", str(e))
+            return None
+
+        qtd = self._manifest.get("resumo", {}).get("paineis", "?")
+        if not repetidos:
+            if QMessageBox.question(
+                    self, "Confirmar importação",
+                    "Importar %s áreas para:\n\n%s" % (qtd, alvo)
+            ) != QMessageBox.StandardButton.Yes:
+                return None
+            return "novo"
+
+        lista = "\n".join("  • %s (Nº Form %s)" % (t, f) for t, f in repetidos[:8])
+        if len(repetidos) > 8:
+            lista += "\n  ... e mais %d." % (len(repetidos) - 8)
+        return self._perguntar(
+            "Áreas já existentes",
+            "%d das %s áreas do pacote já existem neste laudo (mesma identificação):\n\n%s\n\n"
+            "Destino: %s\n\nOs demais entram como novos nos dois casos."
+            % (len(repetidos), qtd, lista, alvo),
+            "Criar novos (renumerando)", "Substituir os existentes")
+
+    def _resolver_conflito_cliente(self, destino_id, alvo: str):
+        """Decide o modo de importacao de um cliente. None = cancelar."""
+        cliente = self._manifest.get("resumo", {}).get("cliente", "—")
+        repetidos = []
+        if destino_id:
+            try:
+                repetidos = backup.conflito_cliente(self._arquivo_import, destino_id)
+            except backup.BackupErro as e:
+                QMessageBox.critical(self, "Falha ao ler o pacote", str(e))
+                return None
+
+        if not repetidos:
+            if QMessageBox.question(
+                    self, "Confirmar importação",
+                    "Importar os dados de '%s' para %s?" % (cliente, alvo)
+            ) != QMessageBox.StandardButton.Yes:
+                return None
+            return "novo"
+
+        lista = "\n".join("  • %s" % n for n in repetidos[:6])
+        if len(repetidos) > 6:
+            lista += "\n  ... e mais %d." % (len(repetidos) - 6)
+        return self._perguntar(
+            "Laudos já existentes",
+            "Este cliente já tem laudo(s) com o mesmo número:\n\n%s\n\n"
+            "Substituir apaga o laudo existente com todas as suas áreas "
+            "e avaliações." % lista,
+            "Criar novos (renumerando)", "Substituir os existentes")
+
+    def _importar(self):
+        if not self._arquivo_import or not self._manifest:
+            return
+        tipo = self._manifest.get("tipo")
+
+        if tipo in ("painel", "paineis"):
+            laudo_id = self.cb_laudo_dest.currentData()
+            if not laudo_id:
+                QMessageBox.warning(
+                    self, "Importar",
+                    "Escolha o cliente e o laudo que vão receber %s.\n\n"
+                    "Se o cliente ainda não tem laudo, crie um na tela de Laudos."
+                    % ("este painel" if tipo == "painel" else "estes painéis"))
+                return
+            alvo = "%s / %s" % (self.cb_cliente_dest.currentText(),
+                                self.cb_laudo_dest.currentText())
+
+            if tipo == "painel":
+                modo = self._resolver_conflito_painel(laudo_id, alvo)
+                funcao, descricao = backup.importar_painel, "painel"
+            else:
+                modo = self._resolver_conflito_paineis(laudo_id, alvo)
+                funcao, descricao = backup.importar_paineis, "áreas"
+            if modo is None:
+                return
+            self._ocupado(True)
+            self._log("Importando %s para %s (modo: %s) ..."
+                      % (descricao, alvo, "substituir" if modo == "substituir" else "criar novo"))
+            self._tarefa = _Tarefa(funcao, self._arquivo_import, laudo_id, modo)
+        else:
+            destino_id = None
+            if self.rb_existente.isChecked():
+                destino_id = self.cb_cliente_dest.currentData()
+                if not destino_id:
+                    QMessageBox.warning(self, "Importar", "Selecione o cliente de destino.")
+                    return
+                alvo = "cliente já cadastrado: %s" % self.cb_cliente_dest.currentText()
+            else:
+                alvo = "um novo cliente"
+
+            modo = self._resolver_conflito_cliente(destino_id, alvo)
+            if modo is None:
+                return
+            self._ocupado(True)
+            self._log("Importando cliente para %s (modo: %s) ..."
+                      % (alvo, "substituir" if modo == "substituir" else "criar novo"))
+            self._tarefa = _Tarefa(backup.importar_cliente, self._arquivo_import,
+                                   destino_id, modo)
+
+        self._tarefa.concluido.connect(self._importacao_ok)
+        self._tarefa.falhou.connect(self._operacao_falhou)
+        self._tarefa.start()
+
+    def _importacao_ok(self, r: dict):
+        self._ocupado(False)
+        self._log("Importação concluída: %d cliente(s), %d laudo(s), %d área(s)."
+                  % (r["clientes"], r["laudos"], r["paineis"]))
+
+        for tag, de, para in r.get("renumerados") or []:
+            self._log("   área '%s': Nº Form %s já ocupado, gravado como %s."
+                      % (tag, de, para))
+        for tag in r.get("substituidos") or []:
+            self._log("   área '%s' substituiu a existente de mesma identificação." % tag)
+        for antigo, novo in r.get("laudos_renomeados") or []:
+            self._log("   laudo '%s' já existia; gravado como '%s'." % (antigo, novo))
+        for numero in r.get("laudos_substituidos") or []:
+            self._log("   laudo '%s' foi substituído (o anterior foi removido)." % numero)
+
+        faltantes = r.get("opcoes_nao_encontradas") or []
+        if faltantes:
+            self._log("AVISO: %d resposta(s) do checklist não existem no checklist local. "
+                      "O peso e os textos foram preservados, mas a opção ficou sem vínculo:"
+                      % len(faltantes))
+            for f in faltantes[:5]:
+                self._log("   %s" % f)
+            if len(faltantes) > 5:
+                self._log("   ... e mais %d." % (len(faltantes) - 5))
+        self.recarregar()
+        self.dados_alterados.emit()
+        QMessageBox.information(
+            self, "Importação concluída",
+            "%d cliente(s), %d laudo(s) e %d área(s) importados."
+            % (r["clientes"], r["laudos"], r["paineis"]))
+
+    def _operacao_falhou(self, erro: str):
+        self._ocupado(False)
+        self._log("ERRO: %s" % erro)
+        QMessageBox.critical(self, "Falha na operação", erro)
