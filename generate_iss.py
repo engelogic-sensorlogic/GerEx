@@ -8,7 +8,7 @@ from pathlib import Path
 from datetime import datetime
 
 APP_NAME = "GerEx"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_PUBLISHER = "Engelogic Automação e Controle Industrial"
 APP_URL = "https://www.engelogic.com.br"
 APP_EXE = "GerEx.exe"
