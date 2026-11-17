@@ -680,6 +680,16 @@ def buscar_fotos_identificacao(painel_id: int) -> dict:
     }
 
 
+def salvar_consideracoes_painel(painel_id: int, texto: str):
+    """Grava as Consideracoes Finais do responsavel tecnico para a area
+    (coluna observacoes_gerais; impressas na Secao 9 do laudo)."""
+    conn = get_connection()
+    conn.execute("UPDATE paineis SET observacoes_gerais=? WHERE id=?",
+                 (texto or None, painel_id))
+    conn.commit()
+    conn.close()
+
+
 def buscar_painel(painel_id: int) -> dict:
     conn = get_connection()
     row = conn.execute("SELECT * FROM paineis WHERE id=?", (painel_id,)).fetchone()

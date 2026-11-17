@@ -508,11 +508,66 @@ class PainelWidget(QWidget):
             self._item_cards.append(card)
             cl_layout.addWidget(card)
 
+        # ── Considerações Finais (Seção 9 do laudo) ───────────────────────
+        cl_layout.addWidget(self._build_consideracoes_card(painel))
+
         cl_layout.addStretch()
         scroll.setWidget(container)
         self.main_layout.addWidget(scroll)
 
         self._update_nivel()
+
+    def _build_consideracoes_card(self, painel: dict) -> QFrame:
+        """Campo livre do responsavel tecnico, apos o ultimo item do checklist.
+        Gravado em paineis.observacoes_gerais e impresso na Secao 9 do PDF."""
+        card = QFrame()
+        card.setObjectName("card")
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QFrame()
+        header.setStyleSheet(f"background: {C_BLACK}; border-radius: 8px 8px 0 0;")
+        h_layout = QHBoxLayout(header)
+        h_layout.setContentsMargins(14, 8, 14, 8)
+        titulo = QLabel("  Considerações Finais do Responsável Técnico")
+        titulo.setStyleSheet(
+            f"color: {C_ORANGE}; font-weight: bold; font-size: 14px;"
+            "background: transparent; padding: 2px 6px;"
+        )
+        h_layout.addWidget(titulo)
+        h_layout.addStretch()
+        layout.addWidget(header)
+
+        body = QWidget()
+        body.setStyleSheet("background: #ffffff; border-radius: 0 0 8px 8px;")
+        b_layout = QVBoxLayout(body)
+        b_layout.setContentsMargins(14, 10, 14, 12)
+        b_layout.setSpacing(8)
+        dica = QLabel(
+            "Descreva suas impressões e considerações sobre o que foi observado "
+            "nesta área. O texto será apresentado na Seção 9 do laudo (PDF)."
+        )
+        dica.setWordWrap(True)
+        dica.setStyleSheet(f"font-size: 11px; color: {COLORS['text_secondary']};")
+        b_layout.addWidget(dica)
+
+        self.consideracoes_edit = QTextEdit()
+        # Texto puro: colar do Word/e-mail nao traz fontes e espacamentos
+        # que o PDF nao reproduz.
+        self.consideracoes_edit.setAcceptRichText(False)
+        self.consideracoes_edit.setStyleSheet("font-size: 13px;")
+        self.consideracoes_edit.setTabChangesFocus(False)  # Tab insere recuo
+        self.consideracoes_edit.setTabStopDistance(40)
+        self.consideracoes_edit.setPlaceholderText(
+            "Impressões gerais, condições observadas no local, pontos de atenção..."
+        )
+        self.consideracoes_edit.setMinimumHeight(140)
+        self.consideracoes_edit.setPlainText(painel.get("observacoes_gerais") or "")
+        b_layout.addWidget(self.consideracoes_edit)
+        layout.addWidget(body)
+        return card
 
     def _update_nivel(self):
         scores = [
@@ -558,6 +613,12 @@ class PainelWidget(QWidget):
                     data["acao_corretiva"],
                 )
                 saved += 1
+
+        db.salvar_consideracoes_painel(
+            # rstrip, nao strip: o Tab de recuo da 1a linha tem de ser mantido.
+            # So espaco em branco vira texto vazio.
+            self._painel_id, self.consideracoes_edit.toPlainText().rstrip()
+            if self.consideracoes_edit.toPlainText().strip() else "")
 
         nivel = db.atualizar_nivel_aderencia(self._painel_id)
         self.nivel_lbl.setText(f"{nivel*100:.1f}%")

@@ -21,6 +21,7 @@ from reportlab.platypus.flowables import Flowable
 from reportlab import platypus
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.lib.utils import simpleSplit
 
 BASE_DIR = Path(__file__).parent
 
@@ -278,11 +279,31 @@ class LaudoCanvas(canvas.Canvas):
         self.rect(0, H - 1.3 * cm, W, 0.1 * cm, stroke=0, fill=1)
         self.setFillColor(C_WHITE)
         self.setFont("Helvetica-Bold", 9)
-        titulo = self._laudo_info.get("titulo", "Laudo de Área Classificada")[:60]
-        self.drawString(MARGIN_L, H - 0.85 * cm, titulo)
         self.setFont("Helvetica", 8)
-        cliente = self._laudo_info.get("cliente", "")[:50]
+        cliente = (self._laudo_info.get("cliente", "") or "")[:50]
         self.drawRightString(W - MARGIN_R, H - 0.85 * cm, cliente)
+        # Titulo completo: quebra em ate 2 linhas na largura livre da faixa
+        # (antes era cortado em 60 caracteres). Se ainda nao couber, reduz a
+        # fonte; so em ultimo caso encurta a 2a linha com reticencias.
+        titulo = self._laudo_info.get("titulo") or "Laudo de Área Classificada"
+        larg = (W - MARGIN_L - MARGIN_R
+                - (stringWidth(cliente, "Helvetica", 8) + 0.6 * cm if cliente else 0))
+        for fs in (9, 8, 7.5):
+            linhas = simpleSplit(titulo, "Helvetica-Bold", fs, larg)
+            if len(linhas) <= 2:
+                break
+        if len(linhas) > 2:
+            resto = " ".join(linhas[1:])
+            while resto and stringWidth(resto + "...", "Helvetica-Bold", fs) > larg:
+                resto = resto[:-1]
+            linhas = [linhas[0], resto.rstrip() + "..."]
+        self.setFillColor(C_WHITE)
+        self.setFont("Helvetica-Bold", fs)
+        if len(linhas) == 1:
+            self.drawString(MARGIN_L, H - 0.85 * cm, linhas[0])
+        else:
+            self.drawString(MARGIN_L, H - 0.62 * cm, linhas[0])
+            self.drawString(MARGIN_L, H - 0.62 * cm - fs * 1.2, linhas[1])
         # Footer
         self.setFillColor(C_NAVY)
         self.rect(0, 0, W, 0.9 * cm, stroke=0, fill=1)
@@ -679,6 +700,8 @@ def gerar_laudo_pdf(
                 ("8.3", "Plano de Ação – Prioridades", 1),
                 ("8.4", "Plano de Ação Individual por Área", 1),
             ]
+            if opcoes.get("consideracoes", True):
+                secoes.append(("9.", "Considerações Finais", 0))
             toc_data = [[Paragraph("<b>Seção</b>", styles["cell_bold_white"]),
                          Paragraph("<b>Descrição</b>", styles["cell_bold_white"]),
                          Paragraph("<b>Pag.</b>", styles["cell_bold_white"])]]
@@ -1995,6 +2018,66 @@ def gerar_laudo_pdf(
                     story.append(Paragraph(
                         "Instale matplotlib para visualização do gráfico: pip install matplotlib",
                         styles["obs"]))
+
+        # ── CONSIDERACOES FINAIS ─────────────────────────────────────────────────────
+        # Texto livre do responsavel tecnico, digitado no fim da tela de
+        # Avaliacao de cada area (paineis.observacoes_gerais).
+        if opcoes.get("consideracoes", True):
+            from xml.sax.saxutils import escape as _xesc
+            prog(90, "Gerando considerações finais...")
+            story.append(PageBreak())
+            add_section("9.", "CONSIDERAÇÕES FINAIS")
+            add_spacer(0.3)
+
+            # Cada Enter digitado no campo vira um paragrafo proprio, com
+            # espaco entre eles (linhas em branco extras sao ignoradas). Antes,
+            # um Enter simples virava so <br/> dentro de um bloco justificado,
+            # e o texto saia compactado, sem separacao de paragrafos.
+            _st_cf = ParagraphStyle("_cf_par", parent=styles["body"],
+                                    leading=16, spaceAfter=0)
+
+            # Tab (ou espacos) no inicio da linha vira recuo da 1a linha do
+            # paragrafo, como no Word: 1,25 cm por Tab. Tab no meio da linha
+            # vira um espaco largo (o PDF nao tem tabulacao).
+            _TAB_CM = 1.25
+
+            def _paragrafos(texto):
+                for linha in texto.replace("\r\n", "\n").split("\n"):
+                    conteudo = linha.lstrip(" \t")
+                    if not conteudo.strip():
+                        continue
+                    prefixo = linha[:len(linha) - len(conteudo)]
+                    recuo = (prefixo.count("\t") * _TAB_CM * cm
+                             + prefixo.count(" ") * stringWidth(" ", "Helvetica", 10))
+                    txt = _xesc(conteudo.rstrip()).replace("\t", "&nbsp;" * 6)
+                    st = _st_cf if not recuo else ParagraphStyle(
+                        "_cf_par_ind", parent=_st_cf, firstLineIndent=recuo)
+                    yield Paragraph(txt, st)
+
+            com_texto = [p for p in paineis if (p.get("observacoes_gerais") or "").strip()]
+            if not com_texto:
+                story.append(Paragraph(
+                    "Não foram registradas considerações finais pelo responsável técnico.",
+                    styles["obs"]))
+            for p in com_texto:
+                hdr = Table([[Paragraph("<b>%s</b>  |  %s" % (
+                    _xesc(p.get("tag") or "Área"), _xesc(p.get("setor") or "—")),
+                    ParagraphStyle("_cf_hdr", parent=styles["white_bold"],
+                                   alignment=TA_LEFT))]], colWidths=[_AW])
+                hdr.setStyle(TableStyle([
+                    ("BACKGROUND",    (0, 0), (-1, -1), C_NAVY),
+                    ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+                    ("TOPPADDING",    (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("LEFTPADDING",   (0, 0), (-1, -1), 12),
+                ]))
+                pars = list(_paragrafos(p["observacoes_gerais"]))
+                # Cabecalho preso ao primeiro paragrafo (nao fica orfao no pe da pagina)
+                story.append(KeepTogether([hdr, Spacer(1, 0.15 * cm), pars[0]]))
+                for par in pars[1:]:
+                    add_spacer(0.3)
+                    story.append(par)
+                add_spacer(0.4)
 
         # ── ASSINATURAS ──────────────────────────────────────────────────────────────
         if opcoes.get("assinaturas", True):
